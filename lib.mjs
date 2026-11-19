@@ -6,7 +6,10 @@ import path from "node:path";
 // Files never copied into the project copy even if tracked.
 export const DENY = [/(^|\/)\.env(\.|$)/, /\.(pem|key|p12|pfx)$/i, /(^|\/)(id_rsa|id_ed25519)/,
   /(^|\/)(secrets?|credentials?)(\.[a-z]+)?$/i, /(^|\/)(AGENTS|CLAUDE)\.md$/, /(^|\/)\.(claude|agents|pi|cursor|windsurf)(\/|$)/,
-  /(^|\/)\.cursorrules$/, /(^|\/)expectations?\.md$/i, /(^|\/)lab-scenarios\.md$/, /(^|\/)lab-reports(\/|$)/];
+  /(^|\/)\.cursorrules$/, /(^|\/)expectations?\.md$/i, /(^|\/)lab-scenarios\.md$/, /(^|\/)lab-reports(\/|$)/,
+  // cloud, registry and VCS credentials
+  /(^|\/)\.(npmrc|netrc|_netrc|pypirc|git-credentials|pgpass|htpasswd)$/i, /\.(tfvars|tfstate)(\.json)?$/i, /(^|\/)\.(aws|ssh|gnupg|kube|docker|azure|gcloud)(\/|$)/,
+  /(^|\/)(kubeconfig|\.?kube[-_]?config)(\.[a-z]+)?$/i, /(^|\/)config\/gcloud(\/|$)/, /\.(kdbx|jks|keystore|ovpn)$/i];
 export const denied = (file) => DENY.some((re) => re.test(file));
 
 // First complete JSON value in a model reply: fenced or bare, ignoring any text (even more JSON) around it.
@@ -76,4 +79,26 @@ export function toolDirs({ agent, cwd, home = os.homedir() }) {
   }
   for (let d = cwd; ; d = path.dirname(d)) { add(path.join(d, ".pi", "extensions"), "project .pi/extensions"); if (d === path.dirname(d)) break; }
   return found;
+}
+
+// Is this process the lab's own `herdr server`? Checked before any signal is sent, because a pid can be reused.
+// cmdline and environ are the raw /proc contents (NUL-separated).
+export function isLabServer({ cmdline = "", environ = "" }, sock) {
+  const argv = cmdline.split("\0").filter(Boolean);
+  if (!argv.length || path.basename(argv[0]) !== "herdr" || !argv.slice(1).includes("server")) return false;
+  return environ.split("\0").includes(`HERDR_SOCKET_PATH=${sock}`);
+}
+
+// "14d" / "12h" / "30m" -> milliseconds; null when it is not that form.
+export function parseAge(text) {
+  const m = /^(\d+)([dhm])$/.exec(text || ""); if (!m) return null;
+  return +m[1] * { d: 864e5, h: 36e5, m: 6e4 }[m[2]];
+}
+
+// lab-*.md reports in `dir` last modified more than `ageMs` before `now`. Other files are never listed.
+export function oldReports(dir, ageMs, now = Date.now()) {
+  let names; try { names = fs.readdirSync(dir); } catch { return []; }
+  return names.filter((n) => /^lab-[a-z0-9]+\.md$/.test(n))
+    .map((n) => ({ file: path.join(dir, n), mtime: fs.statSync(path.join(dir, n)).mtimeMs }))
+    .filter((r) => now - r.mtime > ageMs);
 }

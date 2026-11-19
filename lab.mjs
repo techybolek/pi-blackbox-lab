@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { denied, extractJson, quoteMatch, agentDir, toolDirs, withCapability, tally, UNSUPPORTED_MARK } from "./lib.mjs";
+import { denied, extractJson, quoteMatch, agentDir, toolDirs, withCapability, tally, UNSUPPORTED_MARK, isLabServer, parseAge, oldReports } from "./lib.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Reports go to the project the user runs the lab from, never into the (possibly read-only) package folder.
@@ -37,7 +37,8 @@ usage:
   lab judge <id> "<tried>" "<expected>"   judge the current screen (quotes must be verbatim)
   lab report <id>                     print the report so far
   lab list                            labs started by this tool and still alive
-  lab stop <id>|--all                 close only what the lab started, delete scratch, list leftovers
+  lab stop <id>|--all|--stale         close only what the lab started, delete scratch, list leftovers (--stale: labs whose server is gone)
+  lab prune [--older-than 14d] [--yes]  list (or with --yes delete) old lab-*.md reports in ./lab-reports
   lab --help
 
 each "## " section runs in its own fresh lab (own pi, panes and project copy), so sections cannot affect each other.
@@ -86,6 +87,14 @@ function load(id) {
   try { return JSON.parse(fs.readFileSync(statePath(id), "utf8")); } catch { die(`no such lab: ${id}`); }
 }
 const save = (s) => fs.writeFileSync(statePath(s.id), JSON.stringify(s, null, 1));
+// Read /proc/<pid>/cmdline and environ; empty strings when the process is gone or unreadable.
+const procInfo = (pid) => { const r = (f) => { try { return fs.readFileSync(`/proc/${pid}/${f}`, "utf8"); } catch { return ""; } }; return { cmdline: r("cmdline"), environ: r("environ") }; };
+const serverIsOurs = (s) => !!s?.serverPid && isLabServer(procInfo(s.serverPid), s.sock);
+const readState = (id) => { try { return JSON.parse(fs.readFileSync(statePath(id), "utf8")); } catch { return null; } };
+// A lab nobody is running any more: its server is gone, or it never got one and is older than 10 minutes.
+const isStale = (id) => { const s = readState(id); if (!s) return false;
+  if (s.serverPid) return !serverIsOurs(s);
+  try { return Date.now() - fs.statSync(dirOf(id)).mtimeMs > 600000; } catch { return false; } };
 const labIds = () => fs.readdirSync(TMP).filter((n) => /^lab-[a-z0-9]+$/.test(n) && fs.existsSync(statePath(n)));
 
 // ---------- env ----------
@@ -132,7 +141,9 @@ function doctor() {
   chk("tmp writable", (() => { try { fs.accessSync(TMP, fs.constants.W_OK); return true; } catch { return false; } })(), TMP);
   let bad = 0;
   for (const r of rows) { const optional = /optional|git repo/.test(r.name); out(`${r.ok ? "ok  " : optional ? "warn" : "FAIL"}  ${r.name} — ${r.detail}`); if (!r.ok && !optional) bad++; }
-  const live = labIds(); if (live.length) out(`note: ${live.length} lab(s) alive: ${live.join(", ")}`);
+  const live = labIds(), stale = live.filter(isStale);
+  if (live.length) out(`note: ${live.length} lab(s): ${live.map((i) => i + (stale.includes(i) ? " (STALE)" : "")).join(", ")}`);
+  if (stale.length) out(`warn  ${stale.length} stale lab(s) left by a crashed or killed run; each may hold a copy of your model login in ${TMP}/<id>/. Remove with: lab stop --stale`);
   process.exit(bad ? 1 : 0);
 }
 
@@ -145,6 +156,8 @@ function parseOpts(argv) {
     else if (a === "--project") o.project = argv[++i];
     else if (a === "--model") o.model = argv[++i];
     else if (a === "--keep") o.keep = true;
+    else if (a === "--yes") o.yes = true;
+    else if (a === "--older-than") o.olderThan = argv[++i];
     else if (a === "--no-pi") o.noPi = true;
     else if (a === "--lines") o.lines = +argv[++i];
     else if (a === "--timeout") o.timeout = +argv[++i];
@@ -299,13 +312,13 @@ function piNoTools(s, system, prompt, model) {
 
 const DRIVER = `You drive a terminal lab like a person at the keyboard, one move at a time. You know nothing about the software under test except what the screen shows.
 Each turn you get: the scenario, what you did so far, the current screen of the pane you are looking at, and the lab's own list of panes.
-Reply ONLY JSON: {"why":"one sentence: what you see and why you choose this move","actions":[...],"check":null|{"try":string,"expect":string,"blocked":boolean},"done":boolean}.
+Reply ONLY JSON: {"why":"one sentence: what you see and why you choose this move","plan":null|{"try":string,"expect":string,"blocked":boolean},"actions":[...],"judge":boolean,"done":boolean}.
 Actions (objects): {"type":"<the exact characters to type, e.g. ls -la>"} (types them, does NOT press enter) {"keys":["enter","esc","up","down","tab","ctrl+c"]} {"wait":"literal text","timeout":ms} {"sleep":ms} {"view":"pane id from the pane list"} {"split":"right"|"down"} {"close":true} (these two open/close a raw lab pane: only when the scenario itself talks about panes, never as a stand-in for a command under test) {"screenshot":true}.
 You are told which tools the user loaded into the pi under test. If the scenario names a command or tool that is not among them and the screen does not offer it, set a check saying it is not available, with "blocked":true, and stop; do not test something else in its place. Use "blocked":true on any check that says the scenario could not be carried out.
 Rules: type only what the scenario says to type, nothing else. Do a few actions, then look again; decide from the screen, never from assumptions (in a list, read which line is highlighted and which line you want before pressing keys). After something slow, such as a model reply, wait or sleep and look again.
-When the screen shows the outcome of one sentence of the scenario, set "check" (in the same turn, with no actions or before them): "try" = that sentence in the scenario's words, "expect" = what the scenario's own words say should be visible, written as if you had not yet seen the screen: never describe what the screen actually shows, or the judge can only agree with you. A separate judge decides pass/fail from the screen; you do not. One check per scenario sentence, in order.
-If the scenario only asks you to try something out (no steps given), explore it like a curious tester, in this order: (1) learn what it is for from the screen only: the command list with descriptions (type "/" and read it, then clear the input), its --help, what it shows when run; (2) do the normal use those describe, all the way to its result, doing whatever setup they say it needs; (3) only then edge cases (wrong order, unexpected input, cancelling) and error paths. Set one check per thing you tried: "try" = what you did, "expect" = what a sensible tool should show. Stop after about 6 checks.
-Set "done":true after the last sentence is checked, or if the scenario cannot go on (then add a check saying what blocked it). Do not invent steps: screenshot only if the scenario asks for one.`;
+Every thing you test is a plan, a judgement, in that order. Declare "plan" in the same reply as the first actions of it, BEFORE you see their result: "try" = that sentence of the scenario in its own words (or what you are about to do), "expect" = what the scenario's words (or what a sensible tool) should show. The lab freezes it: you cannot change it later, so it cannot be bent to fit what the screen shows. Do not set "judge":true until the current screen actually shows what the expectation needs; if it does not (a result may be in another pane: look with {"view":...}; a picker or notice may need another look), look first, because judging early only gives an UNCLEAR. When a later screen shows the outcome, set "judge":true (with no new plan for the same thing); a separate judge scores the frozen expectation against the screen, you do not. A sentence that only asks about the current screen (e.g. "Does the picker open?") has no actions: give plan and "judge":true together; the report marks such expectations as set after seeing the screen. One plan at a time, one per scenario sentence, in order.
+If the scenario only asks you to try something out (no steps given), explore it like a curious tester, in this order: (1) learn what it is for from the screen only: the command list with descriptions (type "/" and read it, then clear the input), its --help, what it shows when run; (2) do the normal use those describe, all the way to its result, doing whatever setup they say it needs; (3) only then edge cases (wrong order, unexpected input, cancelling) and error paths. Make one plan per thing you try. Stop after about 6 plans.
+Set "done":true after the last plan is judged, or if the scenario cannot go on (then give a plan saying what blocked it, with "blocked":true and "judge":true). Do not invent steps: screenshot only if the scenario asks for one.`;
 const MAX_TURNS = 30;
 const JUDGE = `You are a black-box tester. You see ONLY the terminal screen text given to you (a BEFORE screen from just before the try, when given, and the AFTER screen), a short note of what was tried, and what was expected. You know nothing else and you may not guess about anything not on screen.
 Reply ONLY JSON: {"verdict":"pass"|"fail"|"unclear","got":"what the screen shows, in your words","quote":"text copied VERBATIM from the screen (one contiguous run, at most 3 lines) that supports your verdict"}.
@@ -347,32 +360,41 @@ const toolNames = (s) => s.tools.map((t) => path.basename(t).replace(/\.(ts|js)$
 // Plain English: the driver reads the screen before every move; the judge only sees the screen at each check.
 async function drivePlain(s, scen, o) {
   addReport(s, `## Scenario: ${scen.name}\n\n${scen.body.trim()}\n`);
-  const res = [], history = []; let did = [], whys = [], before = null;
+  const res = [], history = []; let did = [], whys = [], pending = null;
   const panesAsked = /\bpanes?\b/i.test(scen.body), screenshotAsked = /screenshot/i.test(scen.body);
+  const judgePending = (screen, setAfter) => {
+    const pl = pending; pending = null;
+    const j = judge(s, `${pl.try}\n(actions performed: ${did.join("; ") || "none"})`, pl.expect, screen, pl.before);
+    Object.assign(j, withCapability(j, did, pl.try));
+    if (pl.blocked && j.verdict !== "unsupported") { j.verdict = "unclear"; j.note = [j.note, "driver reports the scenario could not be carried out (blocked); nothing was tested"].filter(Boolean).join("; "); }
+    reportStep(s, `${res.length + 1}. ${pl.try}`, pl.try, pl.expect, did, screen, j,
+      `\n- **Expectation:** ${setAfter ? "set AFTER the driver saw the screen (not independent of it)" : "declared before acting, then frozen"}` +
+      (whys.length ? `\n- driver's reasoning: ${whys.join(" → ")}` : "") +
+      (did.some((x) => x.startsWith(UNSUPPORTED_MARK)) ? "\n- **Missing capability:** screenshot \u2014 herdr has no screenshot command; this was not tested" : ""));
+    res.push(j.verdict); out(`${j.verdict.toUpperCase().padEnd(11)} ${res.length}. ${pl.try}`);
+    history.push(`JUDGED: ${pl.try}`); did = []; whys = [];
+  };
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     const screen = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`;
-    const prompt = `SCENARIO:\n${scen.body.trim()}\n\nTOOLS LOADED IN THE PI UNDER TEST (named by the user): ${toolNames(s)}\n\nDONE SO FAR:\n${history.join("\n") || "(nothing yet)"}\n\nSCREEN of pane ${s.target} (verbatim):\n<<<SCREEN\n${screen}\nSCREEN>>>`;
+    const prompt = `SCENARIO:\n${scen.body.trim()}\n\nTOOLS LOADED IN THE PI UNDER TEST (named by the user): ${toolNames(s)}\n\nDONE SO FAR:\n${history.join("\n") || "(nothing yet)"}\n\nPLAN WAITING FOR ITS RESULT (frozen): ${pending ? JSON.stringify({ try: pending.try, expect: pending.expect }) : "none"}\n\nSCREEN of pane ${s.target} (verbatim):\n<<<SCREEN\n${screen}\nSCREEN>>>`;
     let d; try { d = extractJson(piNoTools(s, DRIVER, prompt, o.model)); } catch (e) { throw new Error(`driver failed on turn ${turn}: ${e.message}`); }
-    before ??= screen;
     if (d.why) { whys.push(d.why); history.push(`turn ${turn} why: ${d.why}`); }
-    if (d.check?.try) {
-      const j = judge(s, `${d.check.try}\n(actions performed: ${did.join("; ") || "none"})`, d.check.expect, screen, before);
-      Object.assign(j, withCapability(j, did, d.check.try));
-      if (d.check.blocked && j.verdict !== "unsupported") { j.verdict = "unclear"; j.note = [j.note, "driver reports the scenario could not be carried out (blocked); nothing was tested"].filter(Boolean).join("; "); }
-      reportStep(s, `${res.length + 1}. ${d.check.try}`, d.check.try, d.check.expect, did, screen, j,
-        (whys.length ? `\n- driver's reasoning: ${whys.join(" → ")}` : "") +
-        (did.some((x) => x.startsWith(UNSUPPORTED_MARK)) ? "\n- **Missing capability:** screenshot — herdr has no screenshot command; this was not tested" : ""));
-      res.push(j.verdict); out(`${j.verdict.toUpperCase().padEnd(11)} ${res.length}. ${d.check.try}`);
-      history.push(`CHECKED: ${d.check.try}`); did = []; whys = []; before = screen;
+    const acts = d.actions || [], wantJudge = !!(d.judge || d.done);
+    if (pending && wantJudge) judgePending(screen, false);            // result of an earlier plan; expectation was frozen before acting
+    if (d.plan?.try && !pending) {
+      pending = { ...d.plan, before: screen };
+      history.push(`PLAN: ${d.plan.try} \u2014 expecting: ${d.plan.expect}`);
+      if (!acts.length && wantJudge) judgePending(screen, true);      // a question about the screen as it is: no way to declare ahead
     }
-    for (const a of d.actions || []) {
-      let r; try { r = (("split" in a || "close" in a) && !panesAsked) ? `ACTION REFUSED: ${JSON.stringify(a)} — raw pane actions only when the scenario talks about panes`
-        : ("screenshot" in a && !screenshotAsked) ? `ACTION REFUSED: screenshot — the scenario does not ask for one` : await act(s, a); } catch (e) { r = `ACTION FAILED: ${e}`; }
+    for (const a of acts) {
+      let r; try { r = (("split" in a || "close" in a) && !panesAsked) ? `ACTION REFUSED: ${JSON.stringify(a)} \u2014 raw pane actions only when the scenario talks about panes`
+        : ("screenshot" in a && !screenshotAsked) ? `ACTION REFUSED: screenshot \u2014 the scenario does not ask for one` : await act(s, a); } catch (e) { r = `ACTION FAILED: ${e}`; }
       did.push(r); history.push(`turn ${turn}: ${r}`);
     }
-    if (d.done) return res;
-    if ((d.actions || []).length) await sleep(800);
+    if (d.done && !pending) return res;                                // a plan declared with actions in the done turn still needs one more look
+    if (acts.length) await sleep(800);
   }
+  if (pending) { addReport(s, `- plan not judged before the turn limit: ${pending.try}\n`); }
   addReport(s, `- driver stopped after ${MAX_TURNS} turns without finishing\n`); res.push("unclear");
   out(`UNCLEAR driver hit ${MAX_TURNS} turns`); return res;
 }
@@ -391,10 +413,12 @@ async function runCmd(argv) {
   const o = parseOpts(argv); const spec = o.rest.join(" ");
   if (!spec) die("run: give a scenario file or description (see lab --help)", 2);
   const scenarios = loadScenarios(spec);
-  let runId, warnings = [], verdicts = [], kept = [];
-  const finish = async (s) => { if (o.keep) kept.push(s.id); else await stop(s.id); };
+  let runId, warnings = [], verdicts = [], kept = [], current = null;
+  const finish = async (s) => { current = null; if (o.keep) kept.push(s.id); else await stop(s.id); };
+  // Ctrl-C / kill: stop the lab in flight so its copy of the model login does not stay in /tmp. SIGKILL cannot be caught: use lab stop --stale.
+  for (const sig of ["SIGINT", "SIGTERM"]) process.once(sig, async () => { if (current) await stop(current, true); process.exit(130); });
   for (const [n, sc] of scenarios.entries()) {
-    const s = await start(argv);
+    const s = await start(argv); current = s.id;
     if (!runId) {
       runId = s.id; warnings = s.warnings || [];
       s.reportId = runId; save(s);
@@ -425,14 +449,17 @@ async function stop(id, quiet = false) {
     if (fs.existsSync(s.sock) && !safe) { log.push(`REFUSED to talk to herdr: its socket is not the lab's ${s.sock}`); left.push("lab herdr server (socket check failed; not stopped)"); }
     if (safe && s.workspace) { const r = herdr(s, ["workspace", "close", s.workspace]); log.push(`workspace ${s.workspace} close: ${r.ok ? "ok" : "failed"}`); }
     if (safe) { const r = herdr(s, ["server", "stop"]); log.push(`lab herdr server stop (socket ${s.sock}): ${r.ok ? "ok" : "failed"}`); await sleep(800); }
-    if (s.serverPid) { try { process.kill(s.serverPid, 0); process.kill(s.serverPid, "SIGTERM"); log.push(`SIGTERM lab server pid ${s.serverPid}`); } catch {} }
+    if (s.serverPid) {
+      if (serverIsOurs(s)) { try { process.kill(s.serverPid, "SIGTERM"); log.push(`SIGTERM lab server pid ${s.serverPid}`); } catch {} }
+      else if (fs.existsSync(`/proc/${s.serverPid}`)) log.push(`pid ${s.serverPid} is not this lab's herdr server (reused?): NOT signalled`);
+    }
   }
   // delete scratch (only dirs created by this tool: /tmp/lab-xxxxxx)
   if (path.dirname(dir) === TMP && /^lab-[a-z0-9]+$/.test(path.basename(dir))) fs.rmSync(dir, { recursive: true, force: true });
   // leftovers
   if (fs.existsSync(dir)) left.push(`dir ${dir}`);
   const ps = run("pgrep", ["-af", dir]).stdout.trim(); if (ps) left.push(`processes:\n${ps}`);
-  if (s?.serverPid) { try { process.kill(s.serverPid, 0); left.push(`pid ${s.serverPid}`); } catch {} }
+  if (serverIsOurs(s)) left.push(`pid ${s.serverPid}`);
   if (!quiet) {
     log.forEach((l) => out(`  ${l}`)); out(`  scratch ${dir}: ${fs.existsSync(dir) ? "NOT deleted" : "deleted"}`);
     out(left.length ? `left behind:\n  ${left.join("\n  ")}` : "left behind: nothing");
@@ -456,10 +483,19 @@ switch (cmd) {
     const screen = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`; const j = judge(s, tried, expected, screen);
     reportStep(s, `judge ${new Date().toISOString()}`, tried, expected, [], screen, j); out(JSON.stringify(j, null, 1)); break; }
   case "report": { const id = argv[0]; if (!fs.existsSync(reportPath(id))) die(`no report for ${id}`); out(fs.readFileSync(reportPath(id), "utf8")); break; }
-  case "list": labIds().forEach((i) => out(i)); break;
+  case "prune": { // reports are evidence: list by default, delete only with --yes
+    const o = parseOpts(argv); const age = parseAge(o.olderThan ?? "14d");
+    if (age == null) die(`prune: --older-than wants a number and d|h|m, e.g. 14d (got "${o.olderThan}")`, 2);
+    const old = oldReports(REPORTS, age);
+    if (!old.length) { out(`no reports older than ${o.olderThan ?? "14d"} in ${REPORTS}`); break; }
+    for (const r of old) { out(`${o.yes ? "deleting" : "would delete"} ${r.file}`); if (o.yes) fs.rmSync(r.file); }
+    if (!o.yes) out(`${old.length} report(s); nothing deleted. Add --yes to delete them.`);
+    break; }
+  case "list": labIds().forEach((i) => out(i + (isStale(i) ? "  (STALE: its server is gone; lab stop --stale)" : ""))); break;
   case "stop": {
-    const ids = argv[0] === "--all" ? labIds() : [argv[0]];
-    if (!ids[0]) die("stop <id>|--all", 2);
+    const ids = argv[0] === "--all" ? labIds() : argv[0] === "--stale" ? labIds().filter(isStale) : [argv[0]];
+    if (!ids[0] && argv[0] === "--stale") { out("no stale labs"); break; }
+    if (!ids[0]) die("stop <id>|--all|--stale", 2);
     for (const i of ids) { out(`stopping ${i}`); await stop(i); } break; }
   default: err(`lab: unknown command "${cmd}"\n`); err(USAGE); process.exit(2);
 }

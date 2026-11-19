@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { denied, extractJson, quoteMatch, agentDir, toolDirs, gitClonePath, withCapability, tally, noticeLevel, UNSUPPORTED_MARK } from "../lib.mjs";
+import { denied, extractJson, quoteMatch, agentDir, toolDirs, gitClonePath, withCapability, tally, noticeLevel, UNSUPPORTED_MARK, isLabServer, parseAge, oldReports } from "../lib.mjs";
 
 const made = [];
 const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), "labtest-")); made.push(d); return d; };
@@ -93,4 +93,32 @@ test("noticeLevel: a finished run with a summary is not an Error", () => {
   assert.equal(noticeLevel(1, "lab: tool not found"), "error");
   assert.equal(noticeLevel(2, "summary: x"), "error");
   assert.equal(noticeLevel(null, ""), "error");
+});
+
+test("deny-list also withholds cloud, registry and VCS credentials", () => {
+  for (const f of [".npmrc", "web/.npmrc", ".netrc", ".pypirc", ".git-credentials", "infra/prod.tfvars", "terraform.tfstate", ".aws/credentials",
+    "home/.ssh/config", ".kube/config", "kubeconfig", "kube-config.yaml", ".docker/config.json", "keys/store.jks", "vpn/work.ovpn", "db.kdbx"]) assert.ok(denied(f), f);
+  for (const f of ["src/npmrc-docs.md", "docs/aws-guide.md", "infra/main.tf", "src/kubernetes.ts", "README.md"]) assert.ok(!denied(f), f);
+});
+
+test("isLabServer accepts only our own herdr server (a reused pid must not match)", () => {
+  const sock = "/tmp/lab-abc123/h.sock", env = (v) => `PATH=/bin\0HERDR_SOCKET_PATH=${v}\0HOME=/x\0`;
+  assert.equal(isLabServer({ cmdline: "/usr/local/bin/herdr\0server\0", environ: env(sock) }, sock), true);
+  assert.equal(isLabServer({ cmdline: "herdr\0server\0", environ: env("/home/u/.config/herdr/h.sock") }, sock), false, "another herdr server (e.g. yours)");
+  assert.equal(isLabServer({ cmdline: "herdr\0pane\0list\0", environ: env(sock) }, sock), false, "not the server subcommand");
+  assert.equal(isLabServer({ cmdline: "/usr/bin/vim\0server\0", environ: env(sock) }, sock), false, "unrelated process");
+  assert.equal(isLabServer({ cmdline: "", environ: "" }, sock), false, "process gone");
+});
+
+test("parseAge reads 14d / 12h / 30m and nothing else", () => {
+  assert.equal(parseAge("14d"), 14 * 864e5); assert.equal(parseAge("12h"), 12 * 36e5); assert.equal(parseAge("30m"), 30 * 6e4);
+  for (const bad of ["", "14", "d", "-1d", "1w", "1.5d", undefined]) assert.equal(parseAge(bad), null, String(bad));
+});
+
+test("oldReports lists only old lab-*.md files", () => {
+  const dir = tmp(), now = Date.now(), day = 864e5;
+  const mk = (name, ageDays) => { const f = path.join(dir, name); fs.writeFileSync(f, "x"); const t = (now - ageDays * day) / 1000; fs.utimesSync(f, t, t); };
+  mk("lab-old111.md", 30); mk("lab-new222.md", 1); mk("notes.md", 90); mk("lab-old333.txt", 90);
+  assert.deepEqual(oldReports(dir, 14 * day, now).map((r) => path.basename(r.file)), ["lab-old111.md"]);
+  assert.deepEqual(oldReports(path.join(dir, "missing"), day, now), []);
 });

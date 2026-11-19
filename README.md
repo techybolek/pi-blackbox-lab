@@ -18,7 +18,8 @@ Needs: `herdr` and `pi` on PATH, a model login in pi, and herdr's pi integration
 lab doctor
 lab run "try out /split" --tool split --project <repo>      # no steps: explores
 lab run lab-scenarios.md --tool split --project <repo>      # "## " sections, one check per sentence
-lab stop --all
+lab stop --all          # or --stale: labs whose server is gone (a crashed or killed run)
+lab prune --older-than 14d [--yes]   # lists old ./lab-reports/lab-*.md; deletes only with --yes
 ```
 - `--tool NAME`: only these exist in the lab's pi. Found in pi's settings (extension folders, installed local/npm packages) and `.pi/extensions` up from the cwd. Git packages are found in the clone pi keeps under `<agent dir>/git/` (ssh-style sources are not: pass a path).
 - `--project`: relative to the cwd; must exist. A git repo is copied by `git ls-files`, minus secrets, agent files, expectation files and `lab-scenarios.md`.
@@ -27,7 +28,12 @@ lab stop --all
 - A run makes model calls (driver, judge, and the pi under test).
 
 ## Reading results
-An explore-mode PASS means nothing looked broken, not that it does what you meant. UNCLEAR is never a pass. UNSUPPORTED means the lab cannot do the step (e.g. a screenshot); it says nothing about the tool. WARNINGs print beside the summary (no `--tool`, project not a git repo).
+In explore mode and in plain-English scenarios the driver declares each expectation before it acts, and the lab freezes it; the report says "declared before acting" (or "set AFTER the driver saw the screen" for a question about the current screen). An explore-mode PASS means nothing looked broken, not that it does what you meant. UNCLEAR is never a pass. UNSUPPORTED means the lab cannot do the step (e.g. a screenshot); it says nothing about the tool. WARNINGs print beside the summary (no `--tool`, project not a git repo).
+
+## Safety
+- The lab copies your model login (`auth.json`) into its scratch folder `/tmp/lab-*` (mode 0600). `lab stop` deletes it; Ctrl-C and `kill` stop the lab in flight; a `kill -9` cannot be caught, so `lab doctor` flags stale labs and `lab stop --stale` removes them.
+- `stop` signals a lab server only after checking `/proc/<pid>` is a `herdr server` with the lab's own socket, so a reused pid is never killed.
+- Files withheld from the project copy include secrets, agent files, and cloud/registry credentials (`.env`, keys, `.npmrc`, `.netrc`, `*.tfvars`, `.aws/`, `.ssh/`, kubeconfig, ...). A deny-list is never complete: review what you copy.
 
 ## Develop
 `npm test` (node:test; no dependencies, no model calls). Credit: the quote check and blank-row squeeze follow [johnlindquist/herdr-pi-lab](https://github.com/johnlindquist/herdr-pi-lab).
