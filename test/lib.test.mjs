@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { denied, extractJson, quoteMatch, agentDir, toolDirs, withCapability, tally, noticeLevel, UNSUPPORTED_MARK } from "../lib.mjs";
+import { denied, extractJson, quoteMatch, agentDir, toolDirs, gitClonePath, withCapability, tally, noticeLevel, UNSUPPORTED_MARK } from "../lib.mjs";
 
 const made = [];
 const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), "labtest-")); made.push(d); return d; };
@@ -51,7 +51,26 @@ test("toolDirs finds settings extensions, local and npm packages, project dirs; 
   assert.ok(dirs.includes(path.join(local, "extensions")) && dirs.includes(path.join(local, "src")));
   assert.ok(dirs.includes(path.join(npmPkg, "extensions")));
   assert.ok(dirs.includes(path.join(cwd, ".pi", "extensions")) && dirs.includes(path.join(root, "proj", ".pi", "extensions")));
-  assert.ok(!dirs.some((d) => d.includes("github.com")));
+  assert.ok(!dirs.some((d) => d.includes("github.com") && !d.includes(path.join(agent, "git"))));
+});
+
+test("gitClonePath maps git sources to pi's clone folder, with or without ref and .git", () => {
+  assert.equal(gitClonePath("git:github.com/o/r"), "github.com/o/r");
+  assert.equal(gitClonePath("git:github.com/o/r@v1.2"), "github.com/o/r");
+  assert.equal(gitClonePath("https://github.com/o/r.git"), "github.com/o/r");
+  assert.equal(gitClonePath("https://github.com/o/r"), "github.com/o/r");
+  assert.equal(gitClonePath("git:git@github.com:o/r.git"), null, "ssh form is not guessed");
+  assert.equal(gitClonePath("npm:@s/x"), null);
+});
+
+test("toolDirs searches a git-installed package's extensions folder", () => {
+  const root = tmp(), agent = path.join(root, "agent");
+  const clone = path.join(agent, "git", "github.com", "o", "r"); fs.mkdirSync(clone, { recursive: true });
+  fs.writeFileSync(path.join(clone, "package.json"), JSON.stringify({ pi: { extensions: ["./src/main.ts"] } }));
+  fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ packages: ["git:github.com/o/r@v1", "git:git@github.com:x/y.git"] }));
+  const dirs = toolDirs({ agent, cwd: root, home: root }).map((x) => x.dir);
+  assert.ok(dirs.includes(path.join(clone, "extensions")) && dirs.includes(path.join(clone, "src")));
+  assert.ok(!dirs.some((d) => d.includes("/x/y")), "unparseable ssh source is skipped, not guessed");
 });
 
 test("a missing screenshot capability is UNSUPPORTED, not pass, fail or unclear", () => {

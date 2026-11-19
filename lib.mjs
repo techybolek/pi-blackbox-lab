@@ -54,14 +54,22 @@ const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); }
 
 // Folders searched for `--tool NAME`, in order, each with what it is (for the error message):
 // extension folders from pi's settings, installed packages (local path or npm), project .pi/extensions up from cwd.
-// Git packages live in a folder pi manages and are not searched.
+// Git packages are searched in the clone pi keeps for them: <agent>/git/<host>/<owner>/<repo> (checked with pi 1.5.2, user scope).
+// "git:github.com/o/r@v1", "https://github.com/o/r.git" -> "github.com/o/r"; anything else (ssh forms) -> null.
+export function gitClonePath(src) {
+  const m = src.match(/^(?:git:|https?:\/\/)(?:git@)?([^/:@]+)\/([^@]+?)(?:\.git)?(?:@[^/@]+)?\/?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
 export function toolDirs({ agent, cwd, home = os.homedir() }) {
   const found = []; const add = (dir, why) => found.push({ dir, why });
   const settings = readJson(path.join(agent, "settings.json")) || {};
   for (const e of settings.extensions || []) add(expand(e, agent, home), "settings.json extensions");
   for (const p of settings.packages || []) {
-    const src = typeof p === "string" ? p : p?.source; if (!src || /^(git:|https?:)/.test(src)) continue;
-    const root = src.startsWith("npm:") ? path.join(agent, "npm", "node_modules", src.slice(4).replace(/@[^/@]+$/, "")) : expand(src, agent, home);
+    const src = typeof p === "string" ? p : p?.source; if (!src) continue;
+    const git = /^(git:|https?:)/.test(src);
+    if (git && !gitClonePath(src)) continue;
+    const root = git ? path.join(agent, "git", gitClonePath(src)) : src.startsWith("npm:") ? path.join(agent, "npm", "node_modules", src.slice(4).replace(/@[^/@]+$/, "")) : expand(src, agent, home);
     const pkg = readJson(path.join(root, "package.json")) || {};
     add(path.join(root, "extensions"), `package ${src}`);
     for (const e of pkg.pi?.extensions || []) add(path.dirname(path.resolve(root, e)), `package ${src}`);

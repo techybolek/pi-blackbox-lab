@@ -51,7 +51,7 @@ notes:
 options (run, start):
   --tool NAME      tool available in the lab (repeatable). Builtin (read bash edit write grep find ls)
                    or an extension NAME found in pi's settings (extensions folders, installed local/npm packages) or
-                   .pi/extensions up from the cwd, or a path. Only these exist. (git packages are not searched: pass a path)
+                   .pi/extensions up from the cwd, or a path. Only these exist. (git packages: found in the clone pi keeps; ssh-form sources: pass a path)
   --project DIR    project to copy (default: cwd). git ls-files when a repo, minus secrets/agent/expectation files.
   --model P/M      model for the pi under test and the judge (default: $PI_PROVIDER/$PI_MODEL)
   --keep           (run) do not stop afterwards
