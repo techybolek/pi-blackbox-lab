@@ -30,3 +30,6 @@ An explore-mode PASS means nothing looked broken, not that it does what you mean
 
 ## Develop
 `npm test` (node:test; no dependencies, no model calls). Credit: the quote check and blank-row squeeze follow [johnlindquist/herdr-pi-lab](https://github.com/johnlindquist/herdr-pi-lab).
+
+## License
+MIT, see [LICENSE](LICENSE).
