@@ -22,6 +22,7 @@ lab stop --all
 ```
 - `--tool NAME`: only these exist in the lab's pi. Found in pi's settings (extension folders, installed local/npm packages) and `.pi/extensions` up from the cwd. Git packages are found in the clone pi keeps under `<agent dir>/git/` (ssh-style sources are not: pass a path).
 - `--project`: relative to the cwd; must exist. A git repo is copied by `git ls-files`, minus secrets, agent files, expectation files and `lab-scenarios.md`.
+- Each `## ` section of a scenario file runs in its own fresh lab, so sections cannot leave conversation, panes or files behind for each other (about 20 s extra per section).
 - Reports: `./lab-reports/<id>.md` ("I tried X, expected Y, got Z" with a verbatim quote).
 - A run makes model calls (driver, judge, and the pi under test).
 

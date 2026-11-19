@@ -40,6 +40,7 @@ usage:
   lab stop <id>|--all                 close only what the lab started, delete scratch, list leftovers
   lab --help
 
+each "## " section runs in its own fresh lab (own pi, panes and project copy), so sections cannot affect each other.
 <scenario> is a .json file (steps), a .md/.txt file (plain-English scenarios, one "## " section each),
 or a quoted description. Plain English is driven step by step by a tool-less driver agent that reads the
 screen before each move; a separate tool-less judge checks each scenario sentence. .json steps run as written.
@@ -320,7 +321,7 @@ function judge(s, tried, expected, screen, before) {
 
 // ---------- report ----------
 const reportPath = (id) => path.join(REPORTS, `${id}.md`);
-function addReport(s, text) { fs.mkdirSync(REPORTS, { recursive: true }); fs.appendFileSync(reportPath(s.id), text + "\n"); }
+function addReport(s, text) { fs.mkdirSync(REPORTS, { recursive: true }); fs.appendFileSync(reportPath(s.reportId || s.id), text + "\n"); }
 function reportStep(s, label, tried, expected, did, screen, j, extra = "") {
   addReport(s, `### ${label}\n- **I tried:** ${tried}${did.length ? `\n  - actions: ${did.join("; ")}` : ""}\n- **Expected:** ${expected}\n- **Got:** ${j.got}\n- **Verdict:** ${j.verdict.toUpperCase()}\n- **Screen quote${j.quoteOk ? ` (${j.quoteOk})` : " (INVALID)"}:** ${j.quote ? "```\n" + j.quote + "\n```" : "(none)"}${j.note ? `\n- note: ${j.note}` : ""}${extra}\n`);
 }
@@ -384,25 +385,33 @@ function loadScenarios(spec) {
   }
   return parts.length ? parts : [{ name: "scenario", body: text, plain: true }];
 }
+// Every scenario gets its own fresh lab (own herdr server, pi, panes and project copy), so one cannot
+// leave conversation, panes or files behind for the next. All of them write into one report, named after the first lab.
 async function runCmd(argv) {
   const o = parseOpts(argv); const spec = o.rest.join(" ");
   if (!spec) die("run: give a scenario file or description (see lab --help)", 2);
-  const s = await start(argv);
-  const t0 = new Date();
-  addReport(s, `# Lab report ${s.id}\n\n- started: ${s.started}\n- tools: ${s.tools.join(", ") || "none"}\n${(s.warnings || []).map((w) => `- **WARNING:** ${w}\n`).join("")}- project copy: ${s.copy.n} files (${s.copy.mode}); withheld ${s.copy.skipped.length}\n- isolation: own herdr server (label \`${s.id}\`), socket \`${s.sock}\`; pi settings dir \`${s.agentDir}\` (auth.json only)\n- screenshots: not supported by herdr; visible pane text only\n- driver: tool-less pi in an empty dir; sees only the scenario, its own past actions and the screen\n- judge: tool-less pi in an empty dir, no context files/skills/extensions; sees only screen text; quotes machine-checked\n`);
-  let verdicts = [];
-  try {
-    for (const sc of loadScenarios(spec)) {
-      s.target = s.piPane; save(s);
-      verdicts.push(...(await (sc.plain ? drivePlain(s, sc, o) : runSteps(s, sc, o))));
-    }
-  } catch (e) { addReport(s, `## ABORTED\n${e.message || e}\n`); err(`lab: ${e.message || e}`); process.exitCode = 1; }
+  const scenarios = loadScenarios(spec);
+  let runId, warnings = [], verdicts = [], kept = [];
+  const finish = async (s) => { if (o.keep) kept.push(s.id); else await stop(s.id); };
+  for (const [n, sc] of scenarios.entries()) {
+    const s = await start(argv);
+    if (!runId) {
+      runId = s.id; warnings = s.warnings || [];
+      s.reportId = runId; save(s);
+      addReport(s, `# Lab report ${runId}\n\n- started: ${s.started}\n- tools: ${s.tools.join(", ") || "none"}\n${warnings.map((w) => `- **WARNING:** ${w}\n`).join("")}- project copy: ${s.copy.n} files (${s.copy.mode}); withheld ${s.copy.skipped.length}\n- isolation: a fresh lab per scenario (own herdr server, socket, pi settings dir with auth.json only, project copy); this one: server \`${s.id}\`, socket \`${s.sock}\`\n- screenshots: not supported by herdr; visible pane text only\n- driver: tool-less pi in an empty dir; sees only the scenario, its own past actions and the screen\n- judge: tool-less pi in an empty dir, no context files/skills/extensions; sees only screen text; quotes machine-checked\n`);
+    } else { s.reportId = runId; save(s); }
+    addReport(s, `_fresh lab ${s.id} (scenario ${n + 1} of ${scenarios.length})_\n`);
+    try { verdicts.push(...(await (sc.plain ? drivePlain(s, sc, o) : runSteps(s, sc, o)))); }
+    catch (e) { addReport(s, `## ABORTED\n${e.message || e}\n`); err(`lab: ${e.message || e}`); process.exitCode = 1; }
+    await finish(s);
+  }
   const tallyText = tally(verdicts);
-  addReport(s, `## Summary\n${tallyText}\n${(s.warnings || []).map((w) => `- **WARNING:** ${w}\n`).join("")}`);
-  out(`\nsummary: ${tallyText}${(s.warnings || []).length ? `  ⚠ ${s.warnings.length} warning(s):` : ""}`);
-  for (const w of s.warnings || []) out(`  ⚠ ${w}`);
-  out(`report: ${reportPath(s.id)}`);
-  if (o.keep) out(`kept: ${s.id} (lab stop ${s.id})`); else await stop(s.id);
+  const last = { id: runId, reportId: runId };
+  addReport(last, `## Summary\n${tallyText}\n${warnings.map((w) => `- **WARNING:** ${w}\n`).join("")}`);
+  out(`\nsummary: ${tallyText}${warnings.length ? `  \u26a0 ${warnings.length} warning(s):` : ""}`);
+  for (const w of warnings) out(`  \u26a0 ${w}`);
+  out(`report: ${reportPath(runId)}`);
+  if (kept.length) out(`kept: ${kept.join(", ")} (lab stop <id>)`);
   if (verdicts.some((v) => v !== "pass")) process.exitCode = 1;
 }
 
@@ -427,8 +436,9 @@ async function stop(id, quiet = false) {
   if (!quiet) {
     log.forEach((l) => out(`  ${l}`)); out(`  scratch ${dir}: ${fs.existsSync(dir) ? "NOT deleted" : "deleted"}`);
     out(left.length ? `left behind:\n  ${left.join("\n  ")}` : "left behind: nothing");
-    if (fs.existsSync(reportPath(id))) out(`kept (not scratch): report ${reportPath(id)}`);
-    if (s?.workspace && fs.existsSync(reportPath(id))) addReport(s, `## Stop\n${log.join("\n")}\nleft behind: ${left.join("; ") || "nothing"}\n`);
+    const rid = s?.reportId || id;
+    if (fs.existsSync(reportPath(rid))) out(`kept (not scratch): report ${reportPath(rid)}`);
+    if (s?.workspace && fs.existsSync(reportPath(rid))) addReport(s, `## Stop\n${log.join("\n")}\nleft behind: ${left.join("; ") || "nothing"}\n`);
   }
   return left;
 }
