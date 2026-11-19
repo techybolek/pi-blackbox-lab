@@ -1,0 +1,455 @@
+#!/usr/bin/env node
+// lab — black-box lab: isolated herdr server + isolated pi, driven through the herdr CLI,
+// judged by a tool-less pi agent that only sees screen text. See `lab --help`.
+import { spawnSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { denied, extractJson, quoteMatch, agentDir, toolDirs, withCapability, tally, UNSUPPORTED_MARK } from "./lib.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// Reports go to the project the user runs the lab from, never into the (possibly read-only) package folder.
+const REPORTS = path.join(process.cwd(), "lab-reports");
+const TMP = os.tmpdir();
+const PREFIX = "lab-";
+const REAL_HOME = os.homedir();
+const REAL_AGENT_DIR = agentDir();
+const HERDR_INTEGRATION = path.join(REAL_AGENT_DIR, "extensions", "herdr-agent-state.ts");
+const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+// Only model-provider credentials are forwarded into the lab. Nothing else from the environment.
+const KEY_VARS = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "FIREWORKS_API_KEY",
+  "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY"];
+
+const USAGE = `lab — isolated black-box lab for pi + herdr
+
+usage:
+  lab doctor                          check herdr, its CLI, pi, auth, tmp space (read-only)
+  lab run <scenario> [options]        start, run every scenario, judge, report, stop
+  lab start [options]                 isolate only; prints the lab id
+  lab drive <id> type "<text>"        type text into the pane under test
+  lab drive <id> keys enter ctrl+c    press keys
+  lab drive <id> read [--lines N]     print visible pane text
+  lab drive <id> wait "<text>" [--timeout MS]
+  lab drive <id> split [right|down]   new pane in the lab; it becomes the target
+  lab drive <id> close                close the split pane (target returns to pi)
+  lab drive <id> screenshot           (herdr has no screenshot; exits 3 and says so)
+  lab judge <id> "<tried>" "<expected>"   judge the current screen (quotes must be verbatim)
+  lab report <id>                     print the report so far
+  lab list                            labs started by this tool and still alive
+  lab stop <id>|--all                 close only what the lab started, delete scratch, list leftovers
+  lab --help
+
+<scenario> is a .json file (steps), a .md/.txt file (plain-English scenarios, one "## " section each),
+or a quoted description. Plain English is driven step by step by a tool-less driver agent that reads the
+screen before each move; a separate tool-less judge checks each scenario sentence. .json steps run as written.
+
+notes:
+  - the driver only knows the tools you load with --tool; a command that is not loaded cannot be tested (the run says so).
+  - the summary prints WARNINGs (no --tool given; project is not a git repo) next to the pass/fail count.
+
+options (run, start):
+  --tool NAME      tool available in the lab (repeatable). Builtin (read bash edit write grep find ls)
+                   or an extension NAME found in pi's settings (extensions folders, installed local/npm packages) or
+                   .pi/extensions up from the cwd, or a path. Only these exist. (git packages are not searched: pass a path)
+  --project DIR    project to copy (default: cwd). git ls-files when a repo, minus secrets/agent/expectation files.
+  --model P/M      model for the pi under test and the judge (default: $PI_PROVIDER/$PI_MODEL)
+  --keep           (run) do not stop afterwards
+  --no-pi          (start/run) do not launch pi; the pane under test is a plain shell
+
+examples:
+  lab doctor
+  lab run lab-scenarios.md --tool split
+  lab run "start pi, type /help, press enter, expect a list of commands" --tool read
+  lab run "try out /split" --tool split --project <repo>   # no steps: the driver explores (learns from the screen, normal use, then edge cases)
+  lab start --tool split        # -> lab-ab12cd
+  lab drive lab-ab12cd type "/split" && lab drive lab-ab12cd keys enter
+  lab drive lab-ab12cd read
+  lab judge lab-ab12cd "typed /split" "a picker opens"
+  lab stop lab-ab12cd
+
+scenario .json: {"name":"x","steps":[{"try":"...","do":[{"type":"/split"},{"keys":["enter"]},
+  {"wait":"text","timeout":8000},{"split":"right"},{"close":true},{"screenshot":true}],"expect":"..."}]}`;
+
+const out = (s = "") => process.stdout.write(s + "\n");
+const err = (s) => process.stderr.write(s + "\n");
+const die = (s, code = 1) => { err(`lab: ${s}`); process.exit(code); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const run = (cmd, args, opt = {}) => spawnSync(cmd, args, { encoding: "utf8", ...opt });
+
+// ---------- state ----------
+const dirOf = (id) => path.join(TMP, id);
+const statePath = (id) => path.join(dirOf(id), "state.json");
+function load(id) {
+  if (!id || !/^lab-[a-z0-9]+$/.test(id)) die(`bad lab id "${id}" (see: lab list)`);
+  try { return JSON.parse(fs.readFileSync(statePath(id), "utf8")); } catch { die(`no such lab: ${id}`); }
+}
+const save = (s) => fs.writeFileSync(statePath(s.id), JSON.stringify(s, null, 1));
+const labIds = () => fs.readdirSync(TMP).filter((n) => /^lab-[a-z0-9]+$/.test(n) && fs.existsSync(statePath(n)));
+
+// ---------- env ----------
+function baseEnv(home, extra = {}) {
+  const e = { PATH: process.env.PATH, HOME: home, TERM: "xterm-256color", LANG: process.env.LANG || "C.UTF-8",
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" };
+  for (const k of KEY_VARS) if (process.env[k]) e[k] = process.env[k];
+  return { ...e, ...extra };
+}
+const herdrEnv = (s) => baseEnv(s.home, { HERDR_SOCKET_PATH: s.sock, HERDR_CLIENT_SOCKET_PATH: s.csock,
+  HERDR_CONFIG_PATH: s.config, PI_CODING_AGENT_DIR: s.agentDir });
+function herdr(s, args, opt = {}) {
+  const r = run("herdr", args, { env: herdrEnv(s), timeout: opt.timeout ?? 60000 });
+  let json; try { json = JSON.parse(r.stdout); } catch {}
+  return { ok: r.status === 0, code: r.status, stdout: r.stdout, stderr: r.stderr, json };
+}
+const modelArgs = (model) => (model ? ["--model", model] : process.env.PI_PROVIDER && process.env.PI_MODEL
+  ? ["--model", `${process.env.PI_PROVIDER}/${process.env.PI_MODEL}`] : []);
+
+// Refuse to talk to any server that is not the lab's own socket (defense in depth: never touch the user's herdr).
+function socketIsLab(s) {
+  const r = herdr(s, ["status"]); const m = r.stdout.match(/^\s*socket:\s*(\S+)/m);
+  return !!m && m[1] === s.sock;
+}
+
+// ---------- doctor ----------
+const cat = (c, a) => { const r = run(c, a); return (r.stdout || "") + (r.stderr || ""); };
+function doctor() {
+  const rows = []; const chk = (name, ok, detail) => { rows.push({ name, ok, detail }); };
+  const v = run("herdr", ["--version"]); chk("herdr binary", v.status === 0, (v.stdout || v.stderr).trim());
+  chk("herdr version tested (optional)", /\b0\.9\./.test(v.stdout || ""), `tested with herdr 0.9.x on Linux; this is ${(v.stdout || v.stderr).trim()}`);
+  const h = cat("herdr", ["pane"]); chk("herdr CLI (pane/agent/session/api)", /pane read/.test(h) && /wait-output/.test(h) && /send-keys/.test(h) && /send-text/.test(h),
+    "needs pane send-text|send-keys|read|wait-output");
+  const a = cat("herdr", ["agent"]); chk("herdr agent kind pi", /kinds:.*\bpi\b/.test(a), "agent start --kind pi");
+  const sc = h + cat("herdr", ["terminal"]) + cat("herdr", ["--help"]);
+  chk("herdr screenshot (optional)", /screenshot/i.test(sc), /screenshot/i.test(sc) ? "supported" : "NOT supported by herdr 0.9.x: lab uses visible pane text only");
+  const p = run("pi", ["--version"]); chk("pi binary", p.status === 0, (p.stdout || p.stderr).trim());
+  const ph = run("pi", ["--help"]).stdout;
+  chk("pi tool limits (--no-tools --tools --no-context-files --no-skills --no-extensions)", ["--no-tools", "--tools", "--no-context-files", "--no-skills", "--no-extensions", "--no-session", "--no-mcp"].every((f) => ph.includes(f)), "judge isolation");
+  const m = modelArgs(); const c = run("pi", ["auth", "check", ...(m.length ? ["--model", m[1]] : ["--provider", "anthropic"])]);
+  chk("herdr pi integration (lets herdr see pi's session)", fs.existsSync(HERDR_INTEGRATION), HERDR_INTEGRATION + " — fix: herdr integration install pi");
+  chk("model login", c.status === 0, `${m[1] || "anthropic"}: ${(c.stdout || c.stderr).trim().split("\n")[0]}`);
+  chk("project is a git repo (else all files minus deny-list)", run("git", ["rev-parse", "--show-toplevel"]).status === 0, process.cwd());
+  chk("tmp writable", (() => { try { fs.accessSync(TMP, fs.constants.W_OK); return true; } catch { return false; } })(), TMP);
+  let bad = 0;
+  for (const r of rows) { const optional = /optional|git repo/.test(r.name); out(`${r.ok ? "ok  " : optional ? "warn" : "FAIL"}  ${r.name} — ${r.detail}`); if (!r.ok && !optional) bad++; }
+  const live = labIds(); if (live.length) out(`note: ${live.length} lab(s) alive: ${live.join(", ")}`);
+  process.exit(bad ? 1 : 0);
+}
+
+// ---------- start ----------
+function parseOpts(argv) {
+  const o = { tools: [], rest: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--tool") o.tools.push(argv[++i]);
+    else if (a === "--project") o.project = argv[++i];
+    else if (a === "--model") o.model = argv[++i];
+    else if (a === "--keep") o.keep = true;
+    else if (a === "--no-pi") o.noPi = true;
+    else if (a === "--lines") o.lines = +argv[++i];
+    else if (a === "--timeout") o.timeout = +argv[++i];
+    else o.rest.push(a);
+  }
+  return o;
+}
+function resolveTools(names) {
+  const builtin = [], ext = [];
+  for (const n of names) {
+    if (BUILTIN_TOOLS.includes(n)) { builtin.push(n); continue; }
+    const dirs = [...new Set(toolDirs({ agent: REAL_AGENT_DIR, cwd: process.cwd() }).map((x) => x.dir))];
+    const cands = [n, ...dirs.flatMap((d) => [path.join(d, n), path.join(d, n + ".ts"), path.join(d, n + ".js")])];
+    const f = cands.find((c) => fs.existsSync(c));
+    if (!f) die(`tool "${n}" not found: not a builtin (${BUILTIN_TOOLS.join(",")}) and no extension named ${n} in ${dirs.join(", ")} (or pass a path) — it does not exist, so the lab cannot offer it`, 2);
+    ext.push(path.resolve(f));
+  }
+  return { builtin, ext };
+}
+function copyProject(project, dest) {
+  const g = run("git", ["-C", project, "ls-files", "-z"]);
+  let files, mode;
+  if (g.status === 0) { files = g.stdout.split("\0").filter(Boolean); mode = "git ls-files"; }
+  else { // not a repo: no tracked-file list exists; copy everything except deny-list
+    files = []; mode = "NOT a git repo: all files minus deny-list";
+    const walk = (d) => { for (const e of fs.readdirSync(path.join(project, d), { withFileTypes: true })) {
+      const rel = path.join(d, e.name); if (e.name === ".git" || e.name === "node_modules") continue;
+      e.isDirectory() ? walk(rel) : files.push(rel); } };
+    walk("");
+  }
+  const skipped = []; let n = 0;
+  for (const f of files) {
+    if (denied(f)) { skipped.push(f); continue; }
+    const src = path.join(project, f); if (!fs.existsSync(src) || fs.statSync(src).isDirectory()) continue;
+    fs.mkdirSync(path.dirname(path.join(dest, f)), { recursive: true }); fs.copyFileSync(src, path.join(dest, f)); n++;
+  }
+  return { n, skipped, mode };
+}
+async function start(argv) {
+  const o = parseOpts(argv);
+  if (run("herdr", ["--version"]).status !== 0) die("herdr not found — run: lab doctor", 2);
+  if (o.project) { // fail before anything is started: a typo must not silently copy some other folder
+    const pr = path.resolve(o.project);
+    if (!fs.existsSync(pr) || !fs.statSync(pr).isDirectory()) die(`--project ${o.project}: no such folder (looked for ${pr}; relative paths are resolved from ${process.cwd()})`, 2);
+  }
+  const { builtin, ext } = resolveTools(o.tools);
+  const id = PREFIX + Math.random().toString(36).slice(2, 8);
+  const dir = dirOf(id);
+  const s = { id, dir, home: path.join(dir, "home"), agentDir: path.join(dir, "pi-agent"), project: path.join(dir, "project"),
+    sock: path.join(dir, "h.sock"), csock: path.join(dir, "c.sock"), config: path.join(dir, "herdr.toml"),
+    judgeDir: path.join(dir, "judge-empty"), judgeAgent: path.join(dir, "judge-agent"), judgeHome: path.join(dir, "judge-home"),
+    tools: o.tools, model: o.model, started: new Date().toISOString(), panes: [], target: null, piPane: null, log: [] };
+  for (const d of [s.home, s.agentDir, s.judgeDir, s.judgeAgent, s.judgeHome]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  fs.writeFileSync(s.config, "onboarding = false\n");
+  save(s);
+  // pi settings: its own folder; only the model logins (auth.json) are reused.
+  for (const d of [s.agentDir, s.judgeAgent]) {
+    const auth = path.join(REAL_AGENT_DIR, "auth.json");
+    if (fs.existsSync(auth)) { fs.copyFileSync(auth, path.join(d, "auth.json")); fs.chmodSync(path.join(d, "auth.json"), 0o600); }
+    fs.writeFileSync(path.join(d, "settings.json"), JSON.stringify({ quietStartup: true, packages: [], extensions: [] }));
+  }
+  const cp = copyProject(path.resolve(o.project || process.cwd()), s.project);
+  s.copy = cp; save(s);
+  // herdr: own server, socket, config, HOME, session name
+  const srv = spawn("herdr", ["server"], { env: herdrEnv(s), detached: true, stdio: ["ignore", fs.openSync(path.join(dir, "server.log"), "a"), "ignore"] });
+  srv.unref(); s.serverPid = srv.pid; save(s);
+  for (let i = 0; i < 50 && !fs.existsSync(s.sock); i++) await sleep(100);
+  if (!herdr(s, ["status"]).ok) { await stop(id, true); die("lab herdr server did not come up", 1); }
+  if (!socketIsLab(s)) { await stop(id, true); die(`herdr reports a socket other than the lab's ${s.sock}; refusing to continue`, 1); }
+  const ws = herdr(s, ["workspace", "create", "--label", id, "--cwd", s.project, "--no-focus"]);
+  if (!ws.ok) { await stop(id, true); die(`workspace create failed: ${ws.stderr || ws.stdout}`); }
+  s.workspace = ws.json.result.workspace.workspace_id; s.piPane = s.target = ws.json.result.root_pane.pane_id;
+  s.panes = [s.piPane]; save(s);
+  if (!o.noPi) {
+    const args = ["--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
+      ...(builtin.length ? ["--tools", builtin.join(",")] : ["--no-builtin-tools"]),
+      // herdr's own pi integration: reports the pi session to the lab's herdr (needed by anything that checks "which pane runs this session", e.g. /split). Not an agent tool; read-only use.
+      ...(fs.existsSync(HERDR_INTEGRATION) ? ["-e", HERDR_INTEGRATION] : []),
+      ...ext.flatMap((e) => ["-e", e]), ...modelArgs(o.model)];
+    const q = (a) => `'${a.replace(/'/g, "'\\''")}'`;
+    herdr(s, ["pane", "run", s.piPane, `cd ${q(s.project)} && pi ${args.map(q).join(" ")}`]);
+    const w = herdr(s, ["pane", "wait-output", s.piPane, "--regex", "(?i)(ctrl\\+|esc to|model|/ for commands|\\$ )", "--timeout", "20000"]);
+    if (!w.ok) err("lab: warning: pi banner not seen within 20s");
+    s.piArgs = args;
+  }
+  save(s);
+  out(id);
+  if (cp.skipped.length) err(`lab: withheld: ${cp.skipped.join(", ")}`);
+  s.warnings = [];
+  if (!o.tools.length && !o.noPi) s.warnings.push("no --tool given: the pi under test has no extensions or builtin tools, so any command you meant to test is not loaded");
+  if (!/^git/.test(cp.mode)) s.warnings.push(`project ${path.resolve(o.project || process.cwd())} is not a git repo: copied every file minus the deny-list (did you mean --project <repo>?)`);
+  save(s); for (const w of s.warnings) err(`lab: WARNING: ${w}`);
+  err(`lab ${id}: own herdr server (name ${id}), socket ${s.sock}, workspace ${s.workspace}, pane ${s.piPane}; project copy ${cp.n} files (${cp.mode}; ${cp.skipped.length} withheld); tools: ${o.tools.join(",") || "none"}`);
+  return s;
+}
+
+// ---------- drive ----------
+function readScreen(s, lines) {
+  const r = herdr(s, ["pane", "read", s.target, "--source", "visible", ...(lines ? ["--lines", String(lines)] : [])]);
+  if (!r.ok) die(`read failed: ${r.stderr || r.stdout}`);
+  // Fullscreen TUIs pad with blank rows; squeeze them so the text that matters is not pushed out.
+  return (r.json?.result?.read?.text ?? r.stdout).replace(/\n[ \t]*(\n[ \t]*)+\n/g, "\n\n");
+}
+// Lab-recorded pane list (from herdr, not from the agent under test): lets the judge see panes opening/closing.
+function paneList(s) {
+  const r = herdr(s, ["pane", "list", "--workspace", s.workspace]);
+  const ps = r.json?.result?.panes;
+  if (!ps) return `(pane list unavailable: ${(r.stderr || r.stdout).trim().slice(0, 100)})`;
+  return `${ps.length} pane(s) in lab workspace: ` + ps.map((p) => `${p.pane_id}${p.pane_id === s.target ? " (shown above)" : ""} agent=${p.agent || "none"}`).join("; ");
+}
+async function act(s, a) { // returns description of what was done; throws string on failure
+  if ("type" in a) { const r = herdr(s, ["pane", "send-text", s.target, a.type]); if (!r.ok) throw r.stderr; return `typed ${JSON.stringify(a.type)}`; }
+  if ("keys" in a) { const k = [].concat(a.keys); const r = herdr(s, ["pane", "send-keys", s.target, ...k]); if (!r.ok) throw r.stderr; return `pressed ${k.join(" ")}`; }
+  if ("wait" in a) { const r = herdr(s, ["pane", "wait-output", s.target, "--match", a.wait, "--source", "visible", "--timeout", String(a.timeout || 10000)], { timeout: (a.timeout || 10000) + 5000 });
+    return r.ok ? `saw ${JSON.stringify(a.wait)}` : `did NOT see ${JSON.stringify(a.wait)} within ${a.timeout || 10000}ms`; }
+  if ("split" in a) { const r = herdr(s, ["pane", "split", s.target, "--direction", a.split === "down" ? "down" : "right", "--cwd", s.project, "--no-focus"]);
+    if (!r.ok) throw r.stderr; const id = r.json.result.pane.pane_id; s.panes.push(id); s.target = id; save(s); await sleep(500); return `split pane ${id}`; }
+  if ("close" in a) { if (s.target === s.piPane) throw "refusing to close the pi pane"; const id = s.target;
+    const r = herdr(s, ["pane", "close", id]); if (!r.ok) throw r.stderr; s.panes = s.panes.filter((p) => p !== id); s.target = s.piPane; save(s); return `closed pane ${id}`; }
+  if ("screenshot" in a) return UNSUPPORTED_MARK + ": herdr 0.9.3 has no screenshot command; visible pane text only";
+  if ("sleep" in a) { await sleep(a.sleep); return `slept ${a.sleep}ms`; }
+  if ("view" in a) { // look at another pane in the lab (e.g. one a command opened); it becomes the target
+    const ps = herdr(s, ["pane", "list", "--workspace", s.workspace]).json?.result?.panes || [];
+    if (!ps.some((p) => p.pane_id === a.view)) throw `no pane ${a.view} in the lab`;
+    s.target = a.view; save(s); return `viewing pane ${a.view}`; }
+  throw `unknown action ${JSON.stringify(a)}`;
+}
+async function drive(argv) {
+  const [id, verb, ...rest] = argv; const o = parseOpts(rest); const s = load(id);
+  const a = o.rest;
+  switch (verb) {
+    case "type": return out(await act(s, { type: a.join(" ") }));
+    case "keys": return out(await act(s, { keys: a }));
+    case "read": return out(readScreen(s, o.lines));
+    case "wait": { const d = await act(s, { wait: a.join(" "), timeout: o.timeout }); out(d); process.exit(d.startsWith("saw") ? 0 : 1); }
+    case "split": return out(await act(s, { split: a[0] }));
+    case "close": return out(await act(s, { close: true }));
+    case "screenshot": err(await act(s, { screenshot: true })); process.exit(3);
+    default: die(`drive: unknown verb "${verb}" (type|keys|read|wait|split|close|screenshot)`, 2);
+  }
+}
+
+// ---------- pi helper agents (driver, judge): no tools, empty dir, no instructions ----------
+function piNoTools(s, system, prompt, model) {
+  const args = ["-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates",
+    "--no-mcp", "--system-prompt", system, ...modelArgs(model || s.model), prompt];
+  const r = run("pi", args, { cwd: s.judgeDir, env: baseEnv(s.judgeHome, { PI_CODING_AGENT_DIR: s.judgeAgent }), timeout: 180000, maxBuffer: 1 << 24 });
+  if (r.status !== 0) throw new Error(`pi helper failed: ${(r.stderr || r.stdout).slice(0, 400)}`);
+  return r.stdout.trim();
+}
+
+const DRIVER = `You drive a terminal lab like a person at the keyboard, one move at a time. You know nothing about the software under test except what the screen shows.
+Each turn you get: the scenario, what you did so far, the current screen of the pane you are looking at, and the lab's own list of panes.
+Reply ONLY JSON: {"why":"one sentence: what you see and why you choose this move","actions":[...],"check":null|{"try":string,"expect":string,"blocked":boolean},"done":boolean}.
+Actions (objects): {"type":"<the exact characters to type, e.g. ls -la>"} (types them, does NOT press enter) {"keys":["enter","esc","up","down","tab","ctrl+c"]} {"wait":"literal text","timeout":ms} {"sleep":ms} {"view":"pane id from the pane list"} {"split":"right"|"down"} {"close":true} (these two open/close a raw lab pane: only when the scenario itself talks about panes, never as a stand-in for a command under test) {"screenshot":true}.
+You are told which tools the user loaded into the pi under test. If the scenario names a command or tool that is not among them and the screen does not offer it, set a check saying it is not available, with "blocked":true, and stop; do not test something else in its place. Use "blocked":true on any check that says the scenario could not be carried out.
+Rules: type only what the scenario says to type, nothing else. Do a few actions, then look again; decide from the screen, never from assumptions (in a list, read which line is highlighted and which line you want before pressing keys). After something slow, such as a model reply, wait or sleep and look again.
+When the screen shows the outcome of one sentence of the scenario, set "check" (in the same turn, with no actions or before them): "try" = that sentence in the scenario's words, "expect" = what the scenario's own words say should be visible, written as if you had not yet seen the screen: never describe what the screen actually shows, or the judge can only agree with you. A separate judge decides pass/fail from the screen; you do not. One check per scenario sentence, in order.
+If the scenario only asks you to try something out (no steps given), explore it like a curious tester, in this order: (1) learn what it is for from the screen only: the command list with descriptions (type "/" and read it, then clear the input), its --help, what it shows when run; (2) do the normal use those describe, all the way to its result, doing whatever setup they say it needs; (3) only then edge cases (wrong order, unexpected input, cancelling) and error paths. Set one check per thing you tried: "try" = what you did, "expect" = what a sensible tool should show. Stop after about 6 checks.
+Set "done":true after the last sentence is checked, or if the scenario cannot go on (then add a check saying what blocked it). Do not invent steps: screenshot only if the scenario asks for one.`;
+const MAX_TURNS = 30;
+const JUDGE = `You are a black-box tester. You see ONLY the terminal screen text given to you (a BEFORE screen from just before the try, when given, and the AFTER screen), a short note of what was tried, and what was expected. You know nothing else and you may not guess about anything not on screen.
+Reply ONLY JSON: {"verdict":"pass"|"fail"|"unclear","got":"what the screen shows, in your words","quote":"text copied VERBATIM from the screen (one contiguous run, at most 3 lines) that supports your verdict"}.
+Judge only what the try produced: text that was already on the BEFORE screen is earlier output, not the result of this try. If the screen does not show enough, verdict is "unclear". The quote must appear character-for-character in the AFTER screen.`;
+
+function judge(s, tried, expected, screen, before) {
+  const prompt = `TRIED:\n${tried}\n\nEXPECTED:\n${expected}\n\n${before ? `BEFORE screen (verbatim):\n<<<BEFORE\n${before}\nBEFORE>>>\n\n` : ""}AFTER screen (verbatim, between the markers):\n<<<SCREEN\n${screen}\nSCREEN>>>`;
+  let j; try { j = extractJson(piNoTools(s, JUDGE, prompt)); } catch (e) { return { verdict: "unclear", got: `judge failed: ${e.message}`, quote: "", quoteOk: false }; }
+  j.quoteOk = quoteMatch(screen, j.quote);
+  if (!j.quoteOk) { j.note = "quote NOT found on screen; verdict downgraded"; if (j.verdict === "pass") j.verdict = "unclear"; }
+  return j;
+}
+
+// ---------- report ----------
+const reportPath = (id) => path.join(REPORTS, `${id}.md`);
+function addReport(s, text) { fs.mkdirSync(REPORTS, { recursive: true }); fs.appendFileSync(reportPath(s.id), text + "\n"); }
+function reportStep(s, label, tried, expected, did, screen, j, extra = "") {
+  addReport(s, `### ${label}\n- **I tried:** ${tried}${did.length ? `\n  - actions: ${did.join("; ")}` : ""}\n- **Expected:** ${expected}\n- **Got:** ${j.got}\n- **Verdict:** ${j.verdict.toUpperCase()}\n- **Screen quote${j.quoteOk ? ` (${j.quoteOk})` : " (INVALID)"}:** ${j.quote ? "```\n" + j.quote + "\n```" : "(none)"}${j.note ? `\n- note: ${j.note}` : ""}${extra}\n`);
+}
+async function runSteps(s, scen, o) {
+  addReport(s, `## Scenario: ${scen.name}\n`);
+  const res = [];
+  for (const [i, st] of scen.steps.entries()) {
+    const did = []; let failedAct = null;
+    const before = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`;
+    for (const a of st.do || []) { try { did.push(await act(s, a)); } catch (e) { failedAct = String(e); did.push(`ACTION FAILED: ${failedAct}`); break; } }
+    await sleep(st.settle ?? 800);
+    const screen = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`;
+    const j = judge(s, `${st.try}\n(actions performed: ${did.join("; ") || "none"})`, st.expect, screen, before);
+    if (failedAct) j.verdict = "fail";
+    const unsupported = did.some((d) => d.startsWith(UNSUPPORTED_MARK));
+    Object.assign(j, withCapability(j, did, st.try));
+    reportStep(s, `${i + 1}. ${scen.name}`, st.try, st.expect, did, screen, j, unsupported ? "\n- **Missing capability:** screenshot — herdr has no screenshot command; this was not tested" : "");
+    res.push(j.verdict); out(`${j.verdict.toUpperCase().padEnd(11)} ${i + 1}. ${st.try}`);
+  }
+  return res;
+}
+const toolNames = (s) => s.tools.map((t) => path.basename(t).replace(/\.(ts|js)$/, "")).join(", ") || "none (plain pi, no extensions or builtin tools)";
+// Plain English: the driver reads the screen before every move; the judge only sees the screen at each check.
+async function drivePlain(s, scen, o) {
+  addReport(s, `## Scenario: ${scen.name}\n\n${scen.body.trim()}\n`);
+  const res = [], history = []; let did = [], whys = [], before = null;
+  const panesAsked = /\bpanes?\b/i.test(scen.body), screenshotAsked = /screenshot/i.test(scen.body);
+  for (let turn = 1; turn <= MAX_TURNS; turn++) {
+    const screen = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`;
+    const prompt = `SCENARIO:\n${scen.body.trim()}\n\nTOOLS LOADED IN THE PI UNDER TEST (named by the user): ${toolNames(s)}\n\nDONE SO FAR:\n${history.join("\n") || "(nothing yet)"}\n\nSCREEN of pane ${s.target} (verbatim):\n<<<SCREEN\n${screen}\nSCREEN>>>`;
+    let d; try { d = extractJson(piNoTools(s, DRIVER, prompt, o.model)); } catch (e) { throw new Error(`driver failed on turn ${turn}: ${e.message}`); }
+    before ??= screen;
+    if (d.why) { whys.push(d.why); history.push(`turn ${turn} why: ${d.why}`); }
+    if (d.check?.try) {
+      const j = judge(s, `${d.check.try}\n(actions performed: ${did.join("; ") || "none"})`, d.check.expect, screen, before);
+      Object.assign(j, withCapability(j, did, d.check.try));
+      if (d.check.blocked && j.verdict !== "unsupported") { j.verdict = "unclear"; j.note = [j.note, "driver reports the scenario could not be carried out (blocked); nothing was tested"].filter(Boolean).join("; "); }
+      reportStep(s, `${res.length + 1}. ${d.check.try}`, d.check.try, d.check.expect, did, screen, j,
+        (whys.length ? `\n- driver's reasoning: ${whys.join(" → ")}` : "") +
+        (did.some((x) => x.startsWith(UNSUPPORTED_MARK)) ? "\n- **Missing capability:** screenshot — herdr has no screenshot command; this was not tested" : ""));
+      res.push(j.verdict); out(`${j.verdict.toUpperCase().padEnd(11)} ${res.length}. ${d.check.try}`);
+      history.push(`CHECKED: ${d.check.try}`); did = []; whys = []; before = screen;
+    }
+    for (const a of d.actions || []) {
+      let r; try { r = (("split" in a || "close" in a) && !panesAsked) ? `ACTION REFUSED: ${JSON.stringify(a)} — raw pane actions only when the scenario talks about panes`
+        : ("screenshot" in a && !screenshotAsked) ? `ACTION REFUSED: screenshot — the scenario does not ask for one` : await act(s, a); } catch (e) { r = `ACTION FAILED: ${e}`; }
+      did.push(r); history.push(`turn ${turn}: ${r}`);
+    }
+    if (d.done) return res;
+    if ((d.actions || []).length) await sleep(800);
+  }
+  addReport(s, `- driver stopped after ${MAX_TURNS} turns without finishing\n`); res.push("unclear");
+  out(`UNCLEAR driver hit ${MAX_TURNS} turns`); return res;
+}
+function loadScenarios(spec) {
+  if (fs.existsSync(spec) && spec.endsWith(".json")) { const j = JSON.parse(fs.readFileSync(spec, "utf8")); return Array.isArray(j) ? j : [j]; }
+  let text = spec, parts = [];
+  if (fs.existsSync(spec)) {
+    text = fs.readFileSync(spec, "utf8");
+    parts = text.split(/^## +/m).slice(1).map((p) => ({ name: p.split("\n")[0].trim(), body: p, plain: true }));
+  }
+  return parts.length ? parts : [{ name: "scenario", body: text, plain: true }];
+}
+async function runCmd(argv) {
+  const o = parseOpts(argv); const spec = o.rest.join(" ");
+  if (!spec) die("run: give a scenario file or description (see lab --help)", 2);
+  const s = await start(argv);
+  const t0 = new Date();
+  addReport(s, `# Lab report ${s.id}\n\n- started: ${s.started}\n- tools: ${s.tools.join(", ") || "none"}\n${(s.warnings || []).map((w) => `- **WARNING:** ${w}\n`).join("")}- project copy: ${s.copy.n} files (${s.copy.mode}); withheld ${s.copy.skipped.length}\n- isolation: own herdr server (label \`${s.id}\`), socket \`${s.sock}\`; pi settings dir \`${s.agentDir}\` (auth.json only)\n- screenshots: not supported by herdr; visible pane text only\n- driver: tool-less pi in an empty dir; sees only the scenario, its own past actions and the screen\n- judge: tool-less pi in an empty dir, no context files/skills/extensions; sees only screen text; quotes machine-checked\n`);
+  let verdicts = [];
+  try {
+    for (const sc of loadScenarios(spec)) {
+      s.target = s.piPane; save(s);
+      verdicts.push(...(await (sc.plain ? drivePlain(s, sc, o) : runSteps(s, sc, o))));
+    }
+  } catch (e) { addReport(s, `## ABORTED\n${e.message || e}\n`); err(`lab: ${e.message || e}`); process.exitCode = 1; }
+  const tallyText = tally(verdicts);
+  addReport(s, `## Summary\n${tallyText}\n${(s.warnings || []).map((w) => `- **WARNING:** ${w}\n`).join("")}`);
+  out(`\nsummary: ${tallyText}${(s.warnings || []).length ? `  ⚠ ${s.warnings.length} warning(s):` : ""}`);
+  for (const w of s.warnings || []) out(`  ⚠ ${w}`);
+  out(`report: ${reportPath(s.id)}`);
+  if (o.keep) out(`kept: ${s.id} (lab stop ${s.id})`); else await stop(s.id);
+  if (verdicts.some((v) => v !== "pass")) process.exitCode = 1;
+}
+
+// ---------- stop ----------
+async function stop(id, quiet = false) {
+  const dir = dirOf(id); let s;
+  try { s = JSON.parse(fs.readFileSync(statePath(id), "utf8")); } catch { if (!fs.existsSync(dir)) die(`no such lab: ${id}`); }
+  const left = []; const log = [];
+  if (s) {
+    const safe = fs.existsSync(s.sock) && socketIsLab(s);
+    if (fs.existsSync(s.sock) && !safe) { log.push(`REFUSED to talk to herdr: its socket is not the lab's ${s.sock}`); left.push("lab herdr server (socket check failed; not stopped)"); }
+    if (safe && s.workspace) { const r = herdr(s, ["workspace", "close", s.workspace]); log.push(`workspace ${s.workspace} close: ${r.ok ? "ok" : "failed"}`); }
+    if (safe) { const r = herdr(s, ["server", "stop"]); log.push(`lab herdr server stop (socket ${s.sock}): ${r.ok ? "ok" : "failed"}`); await sleep(800); }
+    if (s.serverPid) { try { process.kill(s.serverPid, 0); process.kill(s.serverPid, "SIGTERM"); log.push(`SIGTERM lab server pid ${s.serverPid}`); } catch {} }
+  }
+  // delete scratch (only dirs created by this tool: /tmp/lab-xxxxxx)
+  if (path.dirname(dir) === TMP && /^lab-[a-z0-9]+$/.test(path.basename(dir))) fs.rmSync(dir, { recursive: true, force: true });
+  // leftovers
+  if (fs.existsSync(dir)) left.push(`dir ${dir}`);
+  const ps = run("pgrep", ["-af", dir]).stdout.trim(); if (ps) left.push(`processes:\n${ps}`);
+  if (s?.serverPid) { try { process.kill(s.serverPid, 0); left.push(`pid ${s.serverPid}`); } catch {} }
+  if (!quiet) {
+    log.forEach((l) => out(`  ${l}`)); out(`  scratch ${dir}: ${fs.existsSync(dir) ? "NOT deleted" : "deleted"}`);
+    out(left.length ? `left behind:\n  ${left.join("\n  ")}` : "left behind: nothing");
+    if (fs.existsSync(reportPath(id))) out(`kept (not scratch): report ${reportPath(id)}`);
+    if (s?.workspace && fs.existsSync(reportPath(id))) addReport(s, `## Stop\n${log.join("\n")}\nleft behind: ${left.join("; ") || "nothing"}\n`);
+  }
+  return left;
+}
+
+// ---------- main ----------
+const [cmd, ...argv] = process.argv.slice(2);
+switch (cmd) {
+  case undefined: case "--help": case "-h": case "help": out(USAGE); break;
+  case "doctor": doctor(); break;
+  case "start": await start(argv); break;
+  case "run": await runCmd(argv); break;
+  case "drive": await drive(argv); break;
+  case "judge": { const s = load(argv[0]); const [tried, expected] = argv.slice(1);
+    if (!tried || !expected) die("judge <id> \"<tried>\" \"<expected>\"", 2);
+    const screen = readScreen(s) + `\n\n[LAB RECORD, from herdr] ${paneList(s)}`; const j = judge(s, tried, expected, screen);
+    reportStep(s, `judge ${new Date().toISOString()}`, tried, expected, [], screen, j); out(JSON.stringify(j, null, 1)); break; }
+  case "report": { const id = argv[0]; if (!fs.existsSync(reportPath(id))) die(`no report for ${id}`); out(fs.readFileSync(reportPath(id), "utf8")); break; }
+  case "list": labIds().forEach((i) => out(i)); break;
+  case "stop": {
+    const ids = argv[0] === "--all" ? labIds() : [argv[0]];
+    if (!ids[0]) die("stop <id>|--all", 2);
+    for (const i of ids) { out(`stopping ${i}`); await stop(i); } break; }
+  default: err(`lab: unknown command "${cmd}"\n`); err(USAGE); process.exit(2);
+}

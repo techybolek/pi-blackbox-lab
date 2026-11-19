@@ -1,0 +1,71 @@
+// Pure helpers (no I/O beyond the paths given), kept apart from lab.mjs so they can be unit-tested.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// Files never copied into the project copy even if tracked.
+export const DENY = [/(^|\/)\.env(\.|$)/, /\.(pem|key|p12|pfx)$/i, /(^|\/)(id_rsa|id_ed25519)/,
+  /(^|\/)(secrets?|credentials?)(\.[a-z]+)?$/i, /(^|\/)(AGENTS|CLAUDE)\.md$/, /(^|\/)\.(claude|agents|pi|cursor|windsurf)(\/|$)/,
+  /(^|\/)\.cursorrules$/, /(^|\/)expectations?\.md$/i, /(^|\/)lab-scenarios\.md$/, /(^|\/)lab-reports(\/|$)/];
+export const denied = (file) => DENY.some((re) => re.test(file));
+
+// First complete JSON value in a model reply: fenced or bare, ignoring any text (even more JSON) around it.
+export function extractJson(t) {
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fence ? fence[1] : t;
+  const start = body.search(/[\[{]/);
+  if (start < 0) throw new Error("no JSON in reply");
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < body.length; i++) {
+    const c = body[i];
+    if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === "{" || c === "[") depth++;
+    else if ((c === "}" || c === "]") && --depth === 0) return JSON.parse(body.slice(start, i + 1));
+  }
+  throw new Error("unterminated JSON in reply");
+}
+
+const norm = (t) => t.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+// How a judge's quote relates to the screen it was given: "exact", "whitespace-normalised" or false.
+export function quoteMatch(screen, quote) {
+  if (!quote) return false;
+  if (screen.includes(quote)) return "exact";
+  return norm(screen).includes(norm(quote)) ? "whitespace-normalised" : false;
+}
+
+export const UNSUPPORTED_MARK = "SCREENSHOT UNSUPPORTED";
+// A capability the lab lacks (herdr has no screenshot) is neither a pass nor a failure of the tool under test.
+// Only when the step itself is about a screenshot: a stray screenshot action must not hide a real result.
+export function withCapability(j, did, tried) {
+  if (!/screenshot/i.test(tried || "") || !did.some((d) => d.startsWith(UNSUPPORTED_MARK))) return j;
+  return { ...j, verdict: "unsupported", note: [j.note, "the lab cannot do what was asked (no screenshot in herdr); nothing was tested"].filter(Boolean).join("; ") };
+}
+export const VERDICTS = ["pass", "fail", "unclear", "unsupported"];
+export const tally = (verdicts) => VERDICTS.map((v) => `${verdicts.filter((x) => x === v).length} ${v}`).join(", ");
+// How the /lab command shows a finished shell run: a run that completed with a summary is a result, not an error.
+export const noticeLevel = (code, stdout) => (code === 0 ? "info" : code === 1 && /^summary:/m.test(stdout || "") ? "warning" : "error");
+
+// pi's own agent dir: PI_CODING_AGENT_DIR wins, as it does for pi itself.
+export const agentDir = (env = process.env, home = os.homedir()) => env.PI_CODING_AGENT_DIR || path.join(home, ".pi", "agent");
+
+const expand = (p, base, home) => (p.startsWith("~/") ? path.join(home, p.slice(2)) : path.resolve(base, p));
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+
+// Folders searched for `--tool NAME`, in order, each with what it is (for the error message):
+// extension folders from pi's settings, installed packages (local path or npm), project .pi/extensions up from cwd.
+// Git packages live in a folder pi manages and are not searched.
+export function toolDirs({ agent, cwd, home = os.homedir() }) {
+  const found = []; const add = (dir, why) => found.push({ dir, why });
+  const settings = readJson(path.join(agent, "settings.json")) || {};
+  for (const e of settings.extensions || []) add(expand(e, agent, home), "settings.json extensions");
+  for (const p of settings.packages || []) {
+    const src = typeof p === "string" ? p : p?.source; if (!src || /^(git:|https?:)/.test(src)) continue;
+    const root = src.startsWith("npm:") ? path.join(agent, "npm", "node_modules", src.slice(4).replace(/@[^/@]+$/, "")) : expand(src, agent, home);
+    const pkg = readJson(path.join(root, "package.json")) || {};
+    add(path.join(root, "extensions"), `package ${src}`);
+    for (const e of pkg.pi?.extensions || []) add(path.dirname(path.resolve(root, e)), `package ${src}`);
+  }
+  for (let d = cwd; ; d = path.dirname(d)) { add(path.join(d, ".pi", "extensions"), "project .pi/extensions"); if (d === path.dirname(d)) break; }
+  return found;
+}

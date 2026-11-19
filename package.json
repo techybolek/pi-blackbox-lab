@@ -1,0 +1,15 @@
+{
+  "name": "pi-blackbox-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "/lab for pi + herdr: run a tool under test in an isolated herdr server and pi, drive it like a person, judge from the screen, report, and clean up.",
+  "keywords": ["pi-package", "pi", "herdr"],
+  "bin": { "lab": "./lab.mjs" },
+  "pi": {
+    "extensions": ["./extensions/lab.ts"],
+    "skills": ["./skills"]
+  },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
+}
