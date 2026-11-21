@@ -17,9 +17,10 @@ const REAL_HOME = os.homedir();
 const REAL_AGENT_DIR = agentDir();
 const HERDR_INTEGRATION = path.join(REAL_AGENT_DIR, "extensions", "herdr-agent-state.ts");
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-// Only model-provider credentials are forwarded into the lab. Nothing else from the environment.
+// Only model-provider credentials and the CA bundle path (a public certificate, needed behind a TLS-inspecting proxy)
+// are forwarded into the lab. Nothing else from the environment.
 const KEY_VARS = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "FIREWORKS_API_KEY",
-  "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY"];
+  "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY", "NODE_EXTRA_CA_CERTS"];
 
 const USAGE = `lab — isolated black-box lab for pi + herdr
 
@@ -417,6 +418,7 @@ async function runCmd(argv) {
   const finish = async (s) => { current = null; if (o.keep) kept.push(s.id); else await stop(s.id); };
   // Ctrl-C / kill: stop the lab in flight so its copy of the model login does not stay in /tmp. SIGKILL cannot be caught: use lab stop --stale.
   for (const sig of ["SIGINT", "SIGTERM"]) process.once(sig, async () => { if (current) await stop(current, true); process.exit(130); });
+  const aborted = [];
   for (const [n, sc] of scenarios.entries()) {
     const s = await start(argv); current = s.id;
     if (!runId) {
@@ -426,10 +428,11 @@ async function runCmd(argv) {
     } else { s.reportId = runId; save(s); }
     addReport(s, `_fresh lab ${s.id} (scenario ${n + 1} of ${scenarios.length})_\n`);
     try { verdicts.push(...(await (sc.plain ? drivePlain(s, sc, o) : runSteps(s, sc, o)))); }
-    catch (e) { addReport(s, `## ABORTED\n${e.message || e}\n`); err(`lab: ${e.message || e}`); process.exitCode = 1; }
+    catch (e) { addReport(s, `## ABORTED\n${e.message || e}\n`); err(`lab: ${e.message || e}`); process.exitCode = 1; aborted.push(`scenario ${n + 1}: ${e.message || e}`); verdicts.push("fail"); }
     await finish(s);
   }
-  const tallyText = tally(verdicts);
+  // A scenario that crashed did not finish: it counts as one failure and the summary says so, so "0 pass 0 fail" cannot hide it.
+  const tallyText = tally(verdicts) + (aborted.length ? `; ${aborted.length} scenario(s) ABORTED, counted as fail, some steps never ran (${aborted.join(" | ")})` : "");
   const last = { id: runId, reportId: runId };
   addReport(last, `## Summary\n${tallyText}\n${warnings.map((w) => `- **WARNING:** ${w}\n`).join("")}`);
   out(`\nsummary: ${tallyText}${warnings.length ? `  \u26a0 ${warnings.length} warning(s):` : ""}`);
